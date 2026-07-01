@@ -1,0 +1,27 @@
+# Indexer runtime state — clones, graphify outputs, state file
+workdir/
+graphify-out/
+
+# Local override of the committed repos.yaml
+config/repos.yaml.local
+
+# Built binaries when `go build` is run without -o
+/indexer
+/importer
+/query-service
+/mcp-server
+
+# Compiled binaries + editor backups
+*.exe
+*.exe~
+*~
+
+# OS / editor noise
+.DS_Store
+*.swp
+*.log
+
+# graphify: skip test artifacts + fixtures
+workdir-test/
+sample-data/
+.claude/

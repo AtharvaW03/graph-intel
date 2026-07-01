@@ -1,0 +1,19 @@
+repositories:
+  - name: go-kafka-example
+    url: file:///C:/Projects/go-kafka-example
+    branch: main
+
+graphify:
+  args:
+    - update
+    - "{repo_path}"
+
+extractors:
+  deps: true
+  http_api: true
+  kafka: true
+  mssql: true
+  glue: true
+
+org:
+  prefixes: []

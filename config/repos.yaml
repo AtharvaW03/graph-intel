@@ -1,0 +1,52 @@
+# Indexer configuration.
+#
+# `repositories` is the manifest of repos the indexer keeps in sync and
+# imports into Neo4j. Each entry must have a unique name; the name is the
+# stable identifier used as the (:Repository {name}) node in the graph and
+# as the key in state.json, so renaming a repo forces a re-index from
+# scratch.
+#
+# `graphify` controls how the AST extractor is invoked. The default is
+# `graphify update <repo_path>` — graphify's incremental, AST-only
+# workflow (per architecture.md). It writes inside the repo at
+# `<repo_path>/graphify-out/graph.json`, so there is no --out flag and no
+# {out_dir} placeholder. The only supported placeholder in args is
+# {repo_path}; output_file is resolved relative to it.
+#
+# `extractors` enables/disables the platform's domain extractors. They run
+# after graphify and emit Graphify-compatible fragments that are merged
+# into the unified graph.json before import. Leave a key unset to keep the
+# default (enabled).
+#
+# `org.prefixes` are package-name prefixes that identify internal repos so
+# the deps extractor can emit DEPENDS_ON_REPO edges for cross-repo lookups.
+# Match the org's package namespace conventions.
+
+repositories:
+  - name: golang-gin-realworld-example-app
+    url: https://github.com/gothinkster/golang-gin-realworld-example-app.git
+    branch: master
+
+git:
+  timeout: 10m
+
+graphify:
+  command: graphify
+  args:
+    - update
+    - "{repo_path}"
+  output_file: graphify-out/graph.json
+  timeout: 20m
+
+extractors:
+  deps: true
+  http_api: true
+  kafka: true
+  mssql: true
+  glue: true
+  max_parallel: 0  # 0 = all in parallel
+
+org:
+  prefixes:
+    - github.com/angel-one/
+    - github.com/atharva-co/
