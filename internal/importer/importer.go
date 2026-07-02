@@ -19,7 +19,7 @@ type Neo4jClient interface {
 	EnsureConstraints(ctx context.Context) error
 	MergeRepository(ctx context.Context, repo string) error
 	ImportNodes(ctx context.Context, repo, commit string, nodes []graphify.Node) (map[string]string, map[string]int, error)
-	ImportLinks(ctx context.Context, commit string, links []graphify.Link, idToKey map[string]string) (map[string]int, int, int, error)
+	ImportLinks(ctx context.Context, repo, commit string, links []graphify.Link, idToKey map[string]string) (map[string]int, int, int, error)
 	SweepStale(ctx context.Context, repo, commit string) (int, int, error)
 	CountEntitiesForRepo(ctx context.Context, repo string) (int, error)
 }
@@ -159,7 +159,7 @@ func RunWithGraph(ctx context.Context, client Neo4jClient, repo, commit string, 
 	}
 
 	progress(StageLinks)
-	relCounts, skippedUnknown, skippedDangling, err := client.ImportLinks(ctx, commit, g.Links, idToKey)
+	relCounts, skippedUnknown, skippedDangling, err := client.ImportLinks(ctx, repo, commit, g.Links, idToKey)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", StageLinks, err)
 	}

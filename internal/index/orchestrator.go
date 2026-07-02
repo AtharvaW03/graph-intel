@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -110,9 +109,6 @@ func (o *Orchestrator) RunForever(ctx context.Context, opts Options, sched Sched
 			return ctx.Err()
 		}
 		if err := sched.Wait(ctx); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
 			return err
 		}
 	}
@@ -163,17 +159,17 @@ func (o *Orchestrator) IndexOne(ctx context.Context, repo Repository, force bool
 			result.Stage = StagePanic
 			result.Error = fmt.Sprintf("panic: %v", p)
 			result.Duration = o.now().Sub(start)
-			o.persistResult(repo.Name, result, ctx)
+			o.persistResult(repo.Name, result)
 		}
 	}()
 
 	o.runPipeline(ctx, repo, force, prev, start, &result)
-	o.persistResult(repo.Name, result, ctx)
+	o.persistResult(repo.Name, result)
 	o.logResult(result)
 	return result
 }
 
-func (o *Orchestrator) persistResult(name string, r RepoResult, ctx context.Context) {
+func (o *Orchestrator) persistResult(name string, r RepoResult) {
 	if r.Canceled {
 		// A canceled run is not the repo's fault — leave state untouched
 		// so consecutive_fails and last_error are not polluted by SIGINT.

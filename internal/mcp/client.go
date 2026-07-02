@@ -19,17 +19,20 @@ const defaultTimeout = 30 * time.Second
 // Cypher or duplicates query logic.
 type QueryClient struct {
 	baseURL string
+	token   string // bearer token; empty means the service runs unauthenticated
 	http    *http.Client
 }
 
 // NewQueryClient returns a QueryClient pointing at baseURL with the given
-// per-request timeout. timeout <= 0 falls back to defaultTimeout.
-func NewQueryClient(baseURL string, timeout time.Duration) *QueryClient {
+// per-request timeout. timeout <= 0 falls back to defaultTimeout. token, if
+// non-empty, is sent as an Authorization bearer header on every request.
+func NewQueryClient(baseURL string, timeout time.Duration, token string) *QueryClient {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
 	return &QueryClient{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		token:   token,
 		http:    &http.Client{Timeout: timeout},
 	}
 }
@@ -45,6 +48,9 @@ func (c *QueryClient) get(ctx context.Context, path string, query url.Values) (j
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

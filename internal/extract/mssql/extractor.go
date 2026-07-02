@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"graph-platform/internal/extract"
@@ -185,13 +186,7 @@ func splitObjects(text, file string) []objectStmt {
 	}
 
 	// Sort hits by start index ascending — establishes statement boundaries.
-	for i := 0; i < len(hits); i++ {
-		for j := i + 1; j < len(hits); j++ {
-			if hits[j].idx < hits[i].idx {
-				hits[i], hits[j] = hits[j], hits[i]
-			}
-		}
-	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].idx < hits[j].idx })
 	for i, h := range hits {
 		bodyStart := h.end
 		bodyEnd := len(text)
@@ -279,13 +274,32 @@ func emit(frag *extract.Fragment, repoName string, s objectStmt) {
 	emitBodyRefs(frag, objectID, s)
 }
 
+// deleteFromRe locates the FROM keyword inside DELETE FROM statements so the
+// reads scan (bodySelectRe, which matches every FROM) can skip them — a proc
+// that only deletes from a table must not also get a reads_table edge for it.
+var deleteFromRe = regexp.MustCompile(`(?is)\bDELETE\s+(FROM)\b`)
+
 func emitBodyRefs(frag *extract.Fragment, sourceID string, s objectStmt) {
+	deleteFroms := map[int]bool{}
+	for _, m := range deleteFromRe.FindAllStringSubmatchIndex(s.body, -1) {
+		deleteFroms[m[2]] = true // offset of the FROM keyword (group 1 start)
+	}
+
 	addRef := func(re *regexp.Regexp, relation string) {
 		seen := map[string]bool{}
-		for _, m := range re.FindAllStringSubmatch(s.body, -1) {
-			tSchema, tName := "dbo", m[2]
-			if m[1] != "" {
-				tSchema = m[1]
+		for _, idx := range re.FindAllStringSubmatchIndex(s.body, -1) {
+			if re == bodySelectRe && deleteFroms[idx[0]] {
+				continue // this FROM belongs to a DELETE FROM, not a read
+			}
+			group := func(i int) string {
+				if idx[2*i] < 0 {
+					return ""
+				}
+				return s.body[idx[2*i]:idx[2*i+1]]
+			}
+			tSchema, tName := "dbo", group(2)
+			if group(1) != "" {
+				tSchema = group(1)
 			}
 			if tName == "" {
 				continue

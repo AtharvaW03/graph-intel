@@ -207,8 +207,11 @@ RETURN count(DISTINCT n) AS nodes, count(r) AS rels
 }
 
 func (s *Service) overviewLabelCounts(ctx context.Context, repo string) ([]LabeledCount, error) {
+	// Scoped via Repository CONTAINS rather than the repo property so shared
+	// (org-global) entities the repo references — Kafka topics, packages,
+	// SQL objects — appear in the kind counts alongside repo-owned nodes.
 	const cypher = `
-MATCH (n:Entity {repo: $repo})
+MATCH (:Repository {name: $repo})-[:CONTAINS]->(n:Entity)
 UNWIND labels(n) AS l
 WITH l WHERE l <> 'Entity'
 RETURN l AS name, count(*) AS c
@@ -368,11 +371,14 @@ LIMIT $limit
 	return out, err
 }
 
-// overviewKafka returns the repo's topics with their producers and consumers,
-// plus flattened distinct producer/consumer lists.
+// overviewKafka returns the topics the repo references with their producers
+// and consumers, plus flattened distinct producer/consumer lists. Topics are
+// shared (org-global) nodes, so scoping goes via the Repository CONTAINS edge
+// rather than a repo property; the producer/consumer lists deliberately
+// include OTHER repos' hubs — the full topology is the useful answer.
 func (s *Service) overviewKafka(ctx context.Context, repo string) (KafkaSummary, error) {
 	const cypher = `
-MATCH (t:KafkaTopic {repo: $repo})
+MATCH (:Repository {name: $repo})-[:CONTAINS]->(t:KafkaTopic)
 OPTIONAL MATCH (p:Entity)-[:PRODUCES]->(t)
 OPTIONAL MATCH (c:Entity)-[:CONSUMES]->(t)
 RETURN t.name AS topic,
@@ -404,13 +410,14 @@ ORDER BY topic
 	return summary, nil
 }
 
-// overviewSQL groups the repo's SQL objects by kind.
+// overviewSQL groups the SQL objects the repo references by kind. SQL objects
+// are shared (org-global) nodes, so scoping goes via Repository CONTAINS.
 func (s *Service) overviewSQL(ctx context.Context, repo string) (SQLSummary, error) {
 	const cypher = `
-MATCH (o:Entity {repo: $repo})
+MATCH (:Repository {name: $repo})-[:CONTAINS]->(o:Entity)
 WHERE any(l IN labels(o) WHERE l IN
       ['SqlSchema','SqlTable','SqlView','SqlProcedure','SqlFunction','SqlTrigger'])
-RETURN head([l IN labels(o) WHERE l STARTS WITH 'Sql']) AS kind,
+RETURN DISTINCT head([l IN labels(o) WHERE l STARTS WITH 'Sql']) AS kind,
        o.name AS name
 ORDER BY kind, name
 `

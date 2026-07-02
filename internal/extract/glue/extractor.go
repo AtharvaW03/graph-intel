@@ -36,13 +36,14 @@ func New() *Extractor { return &Extractor{MaxFileBytes: 4 * 1024 * 1024} }
 func (e *Extractor) Name() string { return "glue" }
 
 type discoveredJob struct {
-	name        string
-	script      string
-	sources     []string
-	dests       []string
-	schedule    string
-	file        string
-	line        int
+	name       string
+	script     string
+	sources    []string
+	dests      []string
+	schedule   string
+	file       string
+	line       int
+	fromScript bool // discovered by scanning a .py Glue script (vs declared in TF/CFN)
 }
 
 func (e *Extractor) Extract(ctx context.Context, repoPath, repoName string) (*extract.Fragment, error) {
@@ -93,10 +94,75 @@ func (e *Extractor) Extract(ctx context.Context, repoPath, repoName string) (*ex
 		return frag, fmt.Errorf("walk repo: %w", err)
 	}
 
+	jobs = mergeScriptJobs(jobs)
+
+	// Emit the repo hub node ourselves so CONTAINS edges don't dangle when
+	// the deps extractor (which also creates this hub) is disabled.
+	if len(jobs) > 0 {
+		frag.AddNode(extract.FragmentNode{
+			ID:    repoNodeID,
+			Label: repoName,
+			Type:  "package",
+			Metadata: map[string]any{
+				"is_repository": true,
+			},
+		})
+	}
 	for _, j := range jobs {
 		emitJob(frag, repoNodeID, repoName, j)
 	}
 	return frag, nil
+}
+
+// mergeScriptJobs folds script-derived jobs into TF/CFN-declared jobs that
+// reference the same script (matched by script filename): the declared job
+// keeps its name and schedule and absorbs the script's inferred source and
+// destination tables. Script jobs with no declaring resource survive as
+// standalone entries.
+func mergeScriptJobs(jobs []discoveredJob) []discoveredJob {
+	declaredByScript := map[string]int{}
+	for i, j := range jobs {
+		if !j.fromScript && j.script != "" {
+			declaredByScript[scriptBase(j.script)] = i
+		}
+	}
+	out := jobs[:0]
+	for _, j := range jobs {
+		if j.fromScript {
+			if di, ok := declaredByScript[scriptBase(j.script)]; ok {
+				jobs[di].sources = appendUnique(jobs[di].sources, j.sources)
+				jobs[di].dests = appendUnique(jobs[di].dests, j.dests)
+				continue
+			}
+		}
+		out = append(out, j)
+	}
+	return out
+}
+
+// scriptBase normalizes a script reference to its filename so a Terraform
+// script_location like "s3://bucket/scripts/etl_daily.py" matches the local
+// checkout path "jobs/etl_daily.py".
+func scriptBase(script string) string {
+	script = strings.TrimSpace(script)
+	if i := strings.LastIndexAny(script, "/\\"); i >= 0 {
+		script = script[i+1:]
+	}
+	return script
+}
+
+func appendUnique(dst []string, src []string) []string {
+	seen := make(map[string]bool, len(dst))
+	for _, s := range dst {
+		seen[s] = true
+	}
+	for _, s := range src {
+		if !seen[s] {
+			seen[s] = true
+			dst = append(dst, s)
+		}
+	}
+	return dst
 }
 
 // --- Terraform aws_glue_job resource ---
@@ -112,9 +178,9 @@ var (
 
 func parseTerraform(body, file string) []discoveredJob {
 	var out []discoveredJob
-	for _, m := range tfGlueJobRe.FindAllStringSubmatch(body, -1) {
-		resourceName, block := m[1], m[2]
-		j := discoveredJob{file: file}
+	for _, idx := range tfGlueJobRe.FindAllStringSubmatchIndex(body, -1) {
+		resourceName, block := body[idx[2]:idx[3]], body[idx[4]:idx[5]]
+		j := discoveredJob{file: file, line: lineNum(body, idx[0])}
 		if mm := tfNameRe.FindStringSubmatch(block); mm != nil {
 			j.name = mm[1]
 		} else {
@@ -175,38 +241,42 @@ func walkCFResources(doc map[string]any, file string) []discoveredJob {
 	if resources == nil {
 		return out
 	}
+	// Two passes: jobs first, then triggers. Resources is a Go map with
+	// random iteration order — a trigger visited before its job would bind
+	// its schedule to nothing.
 	for logicalID, raw := range resources {
 		res, ok := raw.(map[string]any)
-		if !ok {
+		if !ok || res["Type"] != "AWS::Glue::Job" {
 			continue
 		}
-		typ, _ := res["Type"].(string)
-		switch typ {
-		case "AWS::Glue::Job":
-			props, _ := res["Properties"].(map[string]any)
-			name, _ := props["Name"].(string)
-			if name == "" {
-				name = logicalID
+		props, _ := res["Properties"].(map[string]any)
+		name, _ := props["Name"].(string)
+		if name == "" {
+			name = logicalID
+		}
+		script := ""
+		if cmd, ok := props["Command"].(map[string]any); ok {
+			script, _ = cmd["ScriptLocation"].(string)
+		}
+		out = append(out, discoveredJob{name: name, script: script, file: file})
+	}
+	for _, raw := range resources {
+		res, ok := raw.(map[string]any)
+		if !ok || res["Type"] != "AWS::Glue::Trigger" {
+			continue
+		}
+		props, _ := res["Properties"].(map[string]any)
+		schedule, _ := props["Schedule"].(string)
+		actions, _ := props["Actions"].([]any)
+		for _, a := range actions {
+			action, _ := a.(map[string]any)
+			jobName, _ := action["JobName"].(string)
+			if jobName == "" {
+				continue
 			}
-			script := ""
-			if cmd, ok := props["Command"].(map[string]any); ok {
-				script, _ = cmd["ScriptLocation"].(string)
-			}
-			out = append(out, discoveredJob{name: name, script: script, file: file})
-		case "AWS::Glue::Trigger":
-			props, _ := res["Properties"].(map[string]any)
-			schedule, _ := props["Schedule"].(string)
-			actions, _ := props["Actions"].([]any)
-			for _, a := range actions {
-				action, _ := a.(map[string]any)
-				jobName, _ := action["JobName"].(string)
-				if jobName == "" {
-					continue
-				}
-				for i := range out {
-					if out[i].name == jobName {
-						out[i].schedule = schedule
-					}
+			for i := range out {
+				if out[i].name == jobName {
+					out[i].schedule = schedule
 				}
 			}
 		}
@@ -233,10 +303,10 @@ func parseGlueScript(body, file string) []discoveredJob {
 		return nil
 	}
 	// We don't have the job name in the script itself in general — use the
-	// script filename as a best-effort label. The Terraform/CFN parsers will
-	// override this if the same script is referenced by a declared job.
+	// script filename as a best-effort label. mergeScriptJobs folds this
+	// entry into a TF/CFN-declared job when one references the same script.
 	name := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
-	j := discoveredJob{name: name, script: file, file: file}
+	j := discoveredJob{name: name, script: file, file: file, fromScript: true}
 	for _, m := range glueReadCatalog.FindAllStringSubmatch(body, -1) {
 		j.sources = append(j.sources, m[1]+"."+m[2])
 	}
@@ -253,12 +323,16 @@ func emitJob(frag *extract.Fragment, repoNodeID, repoName string, j discoveredJo
 		return
 	}
 	jobID := "glue::job::" + repoName + "::" + j.name
+	loc := ""
+	if j.line > 0 {
+		loc = fmt.Sprintf("L%d", j.line)
+	}
 	frag.AddNode(extract.FragmentNode{
-		ID:    jobID,
-		Label: j.name,
-		Type:  "glue_job",
-		SourceFile: j.file,
-		SourceLocation: fmt.Sprintf("L%d", j.line),
+		ID:             jobID,
+		Label:          j.name,
+		Type:           "glue_job",
+		SourceFile:     j.file,
+		SourceLocation: loc,
 		Metadata: map[string]any{
 			"repo":     repoName,
 			"script":   j.script,
@@ -305,14 +379,15 @@ func emitJob(frag *extract.Fragment, repoNodeID, repoName string, j discoveredJo
 		})
 	}
 	if j.schedule != "" {
-		schedID := "glue::schedule::" + j.name
+		// Schedule IDs embed the repo: two repos can declare jobs with the
+		// same name, and their schedules are distinct resources.
+		schedID := "glue::schedule::" + repoName + "::" + j.name
 		frag.AddNode(extract.FragmentNode{
 			ID:    schedID,
 			Label: j.schedule,
-			Type:  "glue_job",
+			Type:  "glue_schedule",
 			Metadata: map[string]any{
-				"is_schedule": true,
-				"expression":  j.schedule,
+				"expression": j.schedule,
 			},
 		})
 		frag.AddEdge(extract.FragmentEdge{
@@ -324,6 +399,13 @@ func emitJob(frag *extract.Fragment, repoNodeID, repoName string, j discoveredJo
 			Context:    j.schedule,
 		})
 	}
+}
+
+func lineNum(text string, offset int) int {
+	if offset > len(text) {
+		offset = len(text)
+	}
+	return 1 + strings.Count(text[:offset], "\n")
 }
 
 func shouldSkipDir(name string) bool {

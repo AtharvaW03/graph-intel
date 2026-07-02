@@ -1,14 +1,15 @@
 // Package kafka extracts Kafka topology — topics, producers, consumers —
 // from a repository by scanning source files for the canonical client-library
-// patterns of each supported language. Topic names are extracted from string
-// literals adjacent to producer/consumer constructors. The resulting fragment
-// emits one KafkaTopic node per unique topic, plus PRODUCES/CONSUMES edges
-// from the repository to each topic.
+// call patterns of each supported language. Topic names are extracted from
+// string literals at produce/consume call sites (send, subscribe, listener
+// annotations, reader/writer configs). The resulting fragment emits one
+// KafkaTopic node per unique topic, plus PRODUCES/CONSUMES edges from the
+// repository hub to each topic.
 //
 // This is a strictly heuristic extractor — Kafka clients pass topic names
-// through many indirection layers (config files, env vars, constants).
-// Confidence on every edge is INFERRED, and the fragment carries a topic
-// list operators can cross-reference against runtime metrics.
+// through many indirection layers (config files, env vars, constants), and
+// generic method names like .send("...") can match non-Kafka code.
+// Confidence on every edge is INFERRED for exactly that reason.
 package kafka
 
 import (
@@ -32,44 +33,37 @@ func New() *Extractor { return &Extractor{MaxFileBytes: 2 * 1024 * 1024} }
 
 func (e *Extractor) Name() string { return "kafka" }
 
-// patternSet groups the regexes for one language. Each entry's "Role" is
-// PRODUCES, CONSUMES, or TOPIC (topic-list reference, treated as both unless
-// adjacent producer/consumer context resolves it).
+// patternSet groups the regexes for one language. Every pattern MUST have a
+// capture group for the topic name — a match without a captured topic emits
+// nothing (there is no node to create), so bare constructor-detection
+// patterns like `new KafkaProducer` would be dead weight and are deliberately
+// not included.
 type patternSet struct {
 	produces []*regexp.Regexp
 	consumes []*regexp.Regexp
-	topics   []*regexp.Regexp // any string-literal topic reference
 }
 
 var (
 	// Go: sarama, segmentio/kafka-go, confluent-kafka-go.
 	goPatterns = patternSet{
 		produces: []*regexp.Regexp{
-			regexp.MustCompile(`(?:sarama\.NewSyncProducer|sarama\.NewAsyncProducer|kafka\.Writer|NewProducer)\b`),
 			regexp.MustCompile(`ProducerMessage\s*\{[^}]*Topic\s*:\s*"([^"]+)"`),
 			regexp.MustCompile(`Writer\s*\{[^}]*Topic\s*:\s*"([^"]+)"`),
 		},
 		consumes: []*regexp.Regexp{
-			regexp.MustCompile(`(?:sarama\.NewConsumer|sarama\.NewConsumerGroup|kafka\.NewReader|NewConsumer)\b`),
 			// segmentio/kafka-go: kafka.NewReader(kafka.ReaderConfig{Topic: "..."}) — the
 			// pattern matches both ReaderConfig{} and bare Reader{} initializers.
 			regexp.MustCompile(`Reader(?:Config)?\s*\{[^}]*Topic\s*:\s*"([^"]+)"`),
 			regexp.MustCompile(`ConsumeClaim\s*\([^)]*"([^"]+)"`),
 		},
-		topics: []*regexp.Regexp{
-			regexp.MustCompile(`"([a-z0-9][a-z0-9._\-]+_(?:events|topic|requests|responses|stream))"`),
-		},
 	}
 	// Java/Kotlin/Scala: KafkaProducer/KafkaConsumer, Spring Kafka @KafkaListener.
 	jvmPatterns = patternSet{
 		produces: []*regexp.Regexp{
-			regexp.MustCompile(`new\s+KafkaProducer\b`),
-			regexp.MustCompile(`KafkaTemplate\b`),
 			regexp.MustCompile(`\.send\s*\(\s*new\s+ProducerRecord\s*<[^>]*>\s*\(\s*"([^"]+)"`),
 			regexp.MustCompile(`\.send\s*\(\s*"([^"]+)"`),
 		},
 		consumes: []*regexp.Regexp{
-			regexp.MustCompile(`new\s+KafkaConsumer\b`),
 			regexp.MustCompile(`@KafkaListener\s*\(\s*topics?\s*=\s*[\{"]?([^,)}]+)`),
 			regexp.MustCompile(`\.subscribe\s*\(\s*(?:Collections\.singletonList|Arrays\.asList|List\.of)\s*\(\s*"([^"]+)"`),
 			regexp.MustCompile(`\.subscribe\s*\(\s*"([^"]+)"`),
@@ -78,11 +72,9 @@ var (
 	// Node/TS: kafkajs (producer/consumer) and node-rdkafka.
 	jsPatterns = patternSet{
 		produces: []*regexp.Regexp{
-			regexp.MustCompile(`\.producer\s*\(\s*\)`),
 			regexp.MustCompile(`\.send\s*\(\s*\{[^}]*topic\s*:\s*['"]([^'"]+)['"]`),
 		},
 		consumes: []*regexp.Regexp{
-			regexp.MustCompile(`\.consumer\s*\(\s*\{[^}]*groupId`),
 			regexp.MustCompile(`\.subscribe\s*\(\s*\{[^}]*topic\s*:\s*['"]([^'"]+)['"]`),
 			regexp.MustCompile(`topics\s*:\s*\[\s*['"]([^'"]+)['"]`),
 		},
@@ -90,14 +82,10 @@ var (
 	// Python: confluent-kafka, kafka-python, aiokafka.
 	pyPatterns = patternSet{
 		produces: []*regexp.Regexp{
-			regexp.MustCompile(`Producer\s*\(`),
-			regexp.MustCompile(`KafkaProducer\s*\(`),
-			regexp.MustCompile(`AIOKafkaProducer\s*\(`),
 			regexp.MustCompile(`\.produce\s*\(\s*["']([^"']+)["']`),
 			regexp.MustCompile(`\.send\s*\(\s*["']([^"']+)["']`),
 		},
 		consumes: []*regexp.Regexp{
-			regexp.MustCompile(`Consumer\s*\(`),
 			regexp.MustCompile(`KafkaConsumer\s*\(\s*["']([^"']+)["']`),
 			regexp.MustCompile(`AIOKafkaConsumer\s*\(\s*["']([^"']+)["']`),
 			regexp.MustCompile(`\.subscribe\s*\(\s*\[\s*["']([^"']+)["']`),
@@ -180,12 +168,29 @@ func (e *Extractor) Extract(ctx context.Context, repoPath, repoName string) (*ex
 				}
 			}
 		}
+		if serr := scanner.Err(); serr != nil {
+			frag.Warn(fmt.Sprintf("%s: scan: %v", rel, serr))
+		}
 		_ = f.Close()
 		return nil
 	}
 
 	if err := filepath.WalkDir(repoPath, walk); err != nil {
 		return frag, fmt.Errorf("walk repo: %w", err)
+	}
+
+	// Emit the repo hub node ourselves: PRODUCES/CONSUMES edges hang off it,
+	// and relying on the deps extractor to create it would make this
+	// extractor's edges dangle whenever deps is disabled.
+	if len(produced) > 0 || len(consumed) > 0 {
+		frag.AddNode(extract.FragmentNode{
+			ID:    repoNodeID,
+			Label: repoName,
+			Type:  "package",
+			Metadata: map[string]any{
+				"is_repository": true,
+			},
+		})
 	}
 
 	emitTopics(frag, repoNodeID, repoName, "produces", produced)

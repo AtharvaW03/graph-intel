@@ -26,7 +26,7 @@ func main() {
 		timeout = parsed
 	}
 
-	client := mcp.NewQueryClient(baseURL, timeout)
+	client := mcp.NewQueryClient(baseURL, timeout, os.Getenv("QUERY_AUTH_TOKEN"))
 	server := mcp.NewServer(client)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

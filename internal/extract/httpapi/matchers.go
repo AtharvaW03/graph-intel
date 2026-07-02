@@ -22,7 +22,21 @@ func matchGin(line string, lineNum int) []route { return runRegex(ginEchoChiRe, 
 // matchChi handles chi's lowercase variants (`r.Get`, `r.Post`) which
 // matchGin does NOT cover (it's case-sensitive on the method). Run alongside
 // matchGin so a file using both call styles is fully scanned.
-func matchChi(line string, lineNum int) []route { return runRegex(chiLowerRe, line, lineNum) }
+//
+// `.Get("...")` is an extremely common shape in non-router Go code —
+// viper.Get("server.port"), cache.Get("key"), headers.Get("Accept") — so
+// only paths starting with "/" are accepted. chi route patterns always
+// start with "/"; config keys and cache keys essentially never do.
+func matchChi(line string, lineNum int) []route {
+	rs := runRegex(chiLowerRe, line, lineNum)
+	out := rs[:0]
+	for _, r := range rs {
+		if strings.HasPrefix(r.Path, "/") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
 
 var chiLowerRe = regexp.MustCompile(`\b\w+\.(Get|Post|Put|Delete|Patch|Options|Head|Connect|Trace)\s*\(\s*"([^"]+)"(?:\s*,\s*([A-Za-z0-9_.]+))?`)
 
@@ -97,24 +111,22 @@ func matchExpress(line string, lineNum int) []route {
 }
 
 // --- Java/Kotlin: Spring annotations ---
+//
+// Only the method-specific @GetMapping/@PostMapping/... shortcuts are matched
+// here. Bare @RequestMapping is ambiguous — Spring uses it both as a
+// class-level path prefix and as a method-level route — so the extractor's
+// scan loop handles it with declaration lookahead (see resolveRequestMapping
+// in extractor.go) instead of a stateless per-line matcher.
 
 var springMethodMapping = regexp.MustCompile(`@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(?:value\s*=\s*)?"([^"]+)"`)
-var springRequestMapping = regexp.MustCompile(`@RequestMapping\s*\(\s*(?:value\s*=\s*)?"([^"]+)"(?:[^)]*method\s*=\s*RequestMethod\.([A-Z]+))?`)
 
 func matchSpring(line string, lineNum int) []route {
-	var out []route
-	if m := springMethodMapping.FindStringSubmatch(line); m != nil {
-		method := strings.ToUpper(strings.TrimSuffix(m[1], "Mapping"))
-		out = append(out, route{Method: method, Path: m[2], Line: lineNum})
+	m := springMethodMapping.FindStringSubmatch(line)
+	if m == nil {
+		return nil
 	}
-	if m := springRequestMapping.FindStringSubmatch(line); m != nil {
-		method := "ANY"
-		if m[2] != "" {
-			method = strings.ToUpper(m[2])
-		}
-		out = append(out, route{Method: method, Path: m[1], Line: lineNum})
-	}
-	return out
+	method := strings.ToUpper(strings.TrimSuffix(m[1], "Mapping"))
+	return []route{{Method: method, Path: m[2], Line: lineNum}}
 }
 
 // --- ASP.NET attributes ---

@@ -33,6 +33,7 @@ var typeToLabel = map[string]string{
 	"sql_trigger":    "SqlTrigger",
 	"sql_function":   "SqlFunction",
 	"glue_job":       "GlueJob",
+	"glue_schedule":  "GlueSchedule",
 }
 
 // InferLabel returns the Neo4j label for a node using first-match-wins rules.
@@ -43,7 +44,7 @@ func InferLabel(n Node) string {
 		return l
 	}
 
-	switch n.Metadata.Kind {
+	switch n.MetaString("kind") {
 	case "file", "bash_entrypoint":
 		return "File"
 	case "bash_function":
@@ -118,17 +119,55 @@ func MapRelation(relation string) (string, bool) {
 	return r, ok
 }
 
-// StableKey returns a SHA1 hex key that is stable across re-imports for the
-// same repo + node identity tuple.
+// sharedIDPrefixes are the platform node-ID prefixes that denote org-global
+// entities — one Neo4j node shared by every repo that references it. A Kafka
+// topic, a package, a SQL object, or a repository hub is the same real-world
+// thing no matter which repo's scan discovered it; keeping one node per
+// entity is what makes cross-repo questions ("who consumes trade_executed?",
+// "which repos depend on auth-service?") one-hop traversals.
 //
-// The hash includes Node.ID (graphify's per-repo-stable id) because
-// (source_file, label) alone is NOT unique in real code — a single Go source
-// file typically defines many types that each implement the same method
-// (e.g. 52 distinct types in vendor/.../redis/v9/command.go each declaring
-// .String()). Graphify emits those as distinct nodes with distinct ids;
-// omitting the id here collapses them into one Neo4j Entity via MERGE on
-// node_key, silently losing the other 51 rows and their edges.
+// Shared nodes carry shared=true and NO repo property in Neo4j, and are
+// excluded from the repo-scoped stale sweep (see neo4j.SweepStale).
+var sharedIDPrefixes = []string{"topic::", "pkg::", "sql::", "repo::"}
+
+// IsShared reports whether a platform-emitted node is an org-global entity.
+func IsShared(n Node) bool {
+	if n.Origin != "platform" {
+		return false
+	}
+	for _, p := range sharedIDPrefixes {
+		if strings.HasPrefix(n.ID, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// StableKey returns the Neo4j node_key for a node.
+//
+// Platform-extractor nodes (_origin == "platform") use their extractor-
+// assigned ID directly. Those IDs are globally unique by construction:
+// repo-scoped entities embed the repo name (route::<repo>::...,
+// glue::job::<repo>::...), while org-global entities deliberately share one
+// ID across repos (topic::<name>, pkg::<eco>::<name>, sql::...,
+// repo::<name>) so the same topic or package discovered in two repos merges
+// into ONE node. Hashing these with the repo — as the AST branch below does —
+// would split every shared entity into per-repo copies, leaving cross-repo
+// edges pointing at phantom duplicates and breaking shortest-path /
+// blast-radius traversal across repository boundaries.
+//
+// Graphify AST nodes hash repo + source_file + label + ID. The hash includes
+// Node.ID (graphify's per-repo-stable id) because (source_file, label) alone
+// is NOT unique in real code — a single Go source file typically defines many
+// types that each implement the same method (e.g. 52 distinct types in
+// vendor/.../redis/v9/command.go each declaring .String()). Graphify emits
+// those as distinct nodes with distinct ids; omitting the id here collapses
+// them into one Neo4j Entity via MERGE on node_key, silently losing the other
+// 51 rows and their edges.
 func StableKey(repo string, n Node) string {
+	if n.Origin == "platform" {
+		return "platform::" + n.ID
+	}
 	h := sha1.New()
 	h.Write([]byte(repo + "::" + n.SourceFile + "::" + n.Label + "::" + n.ID))
 	return hex.EncodeToString(h.Sum(nil))

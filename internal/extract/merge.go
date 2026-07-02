@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-
-	"graph-platform/internal/graphify"
 )
 
 // MergeIntoGraphFile merges a set of Fragments into an existing
@@ -242,11 +240,3 @@ func hasMeaningfulValue(v any) bool {
 		return true
 	}
 }
-
-// Ensure graphify import is exercised — Validate uses it indirectly via the
-// node type field, which graphify.InferLabel maps. Reserve this for a future
-// refactor that may want to cross-check that the emitted node.Type is
-// recognized by graphify.InferLabel. For now it's a tiny safety net: any
-// platform-emitted node whose type is not in graphify's typeToLabel falls
-// back to one of the heuristic rules in InferLabel, which is fine.
-var _ = graphify.InferLabel

@@ -48,14 +48,14 @@ func (r *Runner) Run(ctx context.Context, repoPath, repoName string) Result {
 	}
 	results := make(chan partial, len(r.Extractors))
 
-	sem := make(chan struct{}, max(1, r.MaxParallel))
-	if r.MaxParallel <= 0 {
-		sem = make(chan struct{}, len(r.Extractors))
+	parallel := r.MaxParallel
+	if parallel <= 0 {
+		parallel = len(r.Extractors)
 	}
+	sem := make(chan struct{}, parallel)
 
 	var wg sync.WaitGroup
 	for _, ex := range r.Extractors {
-		ex := ex
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -109,11 +109,4 @@ func (r *Runner) Run(ctx context.Context, repoPath, repoName string) Result {
 		res.Fragments = append(res.Fragments, p.frag)
 	}
 	return res
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

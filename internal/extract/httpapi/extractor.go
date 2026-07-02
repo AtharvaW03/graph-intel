@@ -104,29 +104,42 @@ func (e *Extractor) Extract(ctx context.Context, repoPath, repoName string) (*ex
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-		var lastClassAnnotationPath string
+		isJVM := ext == ".java" || ext == ".kt" || ext == ".kts"
+		classPrefix := ""
+		var pending *pendingMapping
 		lineNum := 0
 		for scanner.Scan() {
 			lineNum++
 			line := scanner.Text()
-			// Spring/ASP.NET class-level @RequestMapping("/api") prefix is
-			// applied to method-level mappings below. Track it cheaply.
-			if ext == ".java" || ext == ".kt" || ext == ".kts" {
-				if p := classLevelMapping(line); p != "" {
-					lastClassAnnotationPath = p
+			if isJVM {
+				pending, classPrefix = resolveRequestMapping(frag, repoNodeID, repoName, rel, line, lineNum, pending, classPrefix)
+				if m := requestMappingRe.FindStringSubmatch(line); m != nil {
+					if classDeclRe.MatchString(line) {
+						// Annotation and class declaration on one line
+						// (common in Kotlin): it's a class-level prefix.
+						classPrefix = m[1]
+					} else {
+						pending = &pendingMapping{path: m[1], method: m[2], line: lineNum}
+					}
+					continue
 				}
 			}
 			for _, m := range ms {
-				rs := m(line, lineNum)
-				for _, r := range rs {
-					if lastClassAnnotationPath != "" && !strings.HasPrefix(r.Path, "/") {
-						r.Path = strings.TrimRight(lastClassAnnotationPath, "/") + "/" + r.Path
-					} else if lastClassAnnotationPath != "" && !strings.HasPrefix(r.Path, lastClassAnnotationPath) {
-						r.Path = strings.TrimRight(lastClassAnnotationPath, "/") + r.Path
+				for _, r := range m(line, lineNum) {
+					if isJVM && classPrefix != "" {
+						r.Path = joinPrefix(classPrefix, r.Path)
 					}
 					emitRoute(frag, repoNodeID, repoName, rel, r)
 				}
 			}
+		}
+		if serr := scanner.Err(); serr != nil {
+			frag.Warn(fmt.Sprintf("%s: scan: %v", rel, serr))
+		}
+		// An annotation still pending at EOF annotated nothing we saw —
+		// emit it as a route rather than dropping it silently.
+		if pending != nil {
+			emitPendingAsRoute(frag, repoNodeID, repoName, rel, pending, classPrefix)
 		}
 		_ = f.Close()
 		return nil
@@ -135,7 +148,77 @@ func (e *Extractor) Extract(ctx context.Context, repoPath, repoName string) (*ex
 	if err := filepath.WalkDir(repoPath, walk); err != nil {
 		return frag, fmt.Errorf("walk repo: %w", err)
 	}
+
+	// Emit the repo hub node ourselves so EXPOSES_ROUTE edges don't dangle
+	// when the deps extractor (which also creates this hub) is disabled.
+	if len(frag.Nodes) > 0 {
+		frag.AddNode(extract.FragmentNode{
+			ID:    repoNodeID,
+			Label: repoName,
+			Type:  "package",
+			Metadata: map[string]any{
+				"is_repository": true,
+			},
+		})
+	}
 	return frag, nil
+}
+
+// pendingMapping is an @RequestMapping annotation whose role — class-level
+// path prefix vs method-level route — is not yet known. Spring reuses the
+// same annotation for both; only the declaration that follows disambiguates.
+type pendingMapping struct {
+	path   string
+	method string // captured RequestMethod.X; empty means ANY
+	line   int
+}
+
+var (
+	requestMappingRe = regexp.MustCompile(`@RequestMapping\s*\(\s*(?:value\s*=\s*)?"([^"]+)"(?:[^)]*method\s*=\s*RequestMethod\.([A-Z]+))?`)
+	classDeclRe      = regexp.MustCompile(`\b(?:class|interface|record|object)\s+\w+`)
+)
+
+// resolveRequestMapping advances a pending @RequestMapping against the next
+// line: a class/interface declaration promotes it to the class-level prefix,
+// any other declaration means it was a method-level route (emitted here), and
+// blank lines / comments / stacked annotations keep it pending. Returns the
+// updated pending state and class prefix.
+func resolveRequestMapping(frag *extract.Fragment, repoNodeID, repoName, file, line string, _ int, pending *pendingMapping, classPrefix string) (*pendingMapping, string) {
+	if pending == nil {
+		return nil, classPrefix
+	}
+	t := strings.TrimSpace(line)
+	switch {
+	case t == "" || strings.HasPrefix(t, "//") || strings.HasPrefix(t, "*") || strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "@"):
+		return pending, classPrefix // still looking past comments/annotations
+	case classDeclRe.MatchString(t):
+		return nil, pending.path
+	default:
+		emitPendingAsRoute(frag, repoNodeID, repoName, file, pending, classPrefix)
+		return nil, classPrefix
+	}
+}
+
+func emitPendingAsRoute(frag *extract.Fragment, repoNodeID, repoName, file string, p *pendingMapping, classPrefix string) {
+	method := p.method
+	if method == "" {
+		method = "ANY"
+	}
+	emitRoute(frag, repoNodeID, repoName, file, route{
+		Method: method,
+		Path:   joinPrefix(classPrefix, p.path),
+		Line:   p.line,
+	})
+}
+
+// joinPrefix concatenates a Spring class-level prefix and a method-level path
+// per Spring's semantics: "/api" + "users" and "/api" + "/users" both resolve
+// to "/api/users".
+func joinPrefix(prefix, p string) string {
+	if prefix == "" {
+		return p
+	}
+	return strings.TrimRight(prefix, "/") + "/" + strings.TrimLeft(strings.TrimSpace(p), "/")
 }
 
 func emitRoute(frag *extract.Fragment, repoNodeID, repoName, file string, r route) {
@@ -188,19 +271,3 @@ func shouldSkipDir(name string) bool {
 	return false
 }
 
-// classLevelMapping returns the path prefix declared on a Spring
-// @RequestMapping/@Path annotation at the class level (rough heuristic — we
-// match any @RequestMapping with a literal path string preceding the class
-// declaration on the same logical declaration unit).
-var classMappingRe = regexp.MustCompile(`@(?:RequestMapping|Path)\s*\(\s*(?:value\s*=\s*)?"([^"]+)"`)
-
-func classLevelMapping(line string) string {
-	if !strings.Contains(line, "@RequestMapping") && !strings.Contains(line, "@Path(") {
-		return ""
-	}
-	m := classMappingRe.FindStringSubmatch(line)
-	if m == nil {
-		return ""
-	}
-	return m[1]
-}

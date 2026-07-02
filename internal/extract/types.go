@@ -19,7 +19,8 @@ import (
 )
 
 // Confidence labels follow Graphify's three-tier model (see
-// graphify-how-it-works.md). EXTRACTED edges always have confidence_score 1.0.
+// docs/graphify/graphify-how-it-works.md). EXTRACTED edges always have
+// confidence_score 1.0.
 const (
 	ConfidenceExtracted = "EXTRACTED"
 	ConfidenceInferred  = "INFERRED"
@@ -67,6 +68,10 @@ type Fragment struct {
 	Nodes     []FragmentNode `json:"nodes"`
 	Edges     []FragmentEdge `json:"edges"`
 	Warnings  []string       `json:"-"` // non-fatal issues surfaced to operators
+
+	// byID indexes Nodes by ID for AddNode's dedup. Built lazily so a
+	// Fragment constructed by literal or JSON unmarshal still works.
+	byID map[string]int
 }
 
 // NewFragment returns an empty fragment tagged with the extractor's name.
@@ -90,12 +95,17 @@ func (f *Fragment) AddNode(n FragmentNode) {
 	if n.NormLabel == "" {
 		n.NormLabel = n.Label
 	}
-	for i := range f.Nodes {
-		if f.Nodes[i].ID == n.ID {
-			mergeNodeInPlace(&f.Nodes[i], n)
-			return
+	if f.byID == nil {
+		f.byID = make(map[string]int, len(f.Nodes))
+		for i := range f.Nodes {
+			f.byID[f.Nodes[i].ID] = i
 		}
 	}
+	if i, ok := f.byID[n.ID]; ok {
+		mergeNodeInPlace(&f.Nodes[i], n)
+		return
+	}
+	f.byID[n.ID] = len(f.Nodes)
 	f.Nodes = append(f.Nodes, n)
 }
 
@@ -190,10 +200,12 @@ type Extractor interface {
 	Extract(ctx context.Context, repoPath, repoName string) (*Fragment, error)
 }
 
-// Validate enforces the minimal schema invariants build_graph relies on.
-// Edges whose source or target IDs are missing from the node list are
-// dropped with a warning rather than erroring — they likely refer to nodes
-// graphify itself will emit, and the merge will resolve them.
+// Validate enforces the minimal schema invariants build_graph relies on:
+// non-empty node IDs and labels, non-empty edge endpoints and relations, and
+// a recognized confidence tier. Edges referencing node IDs absent from this
+// fragment are deliberately NOT rejected — they may resolve against nodes
+// another fragment or graphify itself emits; anything still dangling is
+// counted and skipped at import time.
 func (f *Fragment) Validate() error {
 	if f == nil {
 		return fmt.Errorf("nil fragment")

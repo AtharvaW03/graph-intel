@@ -6,24 +6,28 @@ type Graph struct {
 	HyperEdges []HyperEdge `json:"hyperedges"`
 }
 
-type NodeMetadata struct {
-	Kind     string `json:"kind"`
-	Language string `json:"language"`
+type Node struct {
+	ID             string         `json:"id"`
+	Label          string         `json:"label"`
+	NormLabel      string         `json:"norm_label"`
+	Origin         string         `json:"_origin"`
+	FileType       string         `json:"file_type"`
+	Community      int            `json:"community"`
+	CommunityName  string         `json:"community_name"`
+	SourceFile     string         `json:"source_file"`
+	SourceLocation string         `json:"source_location"`
+	Type           string         `json:"type"`
+	Ecosystem      string         `json:"ecosystem"`
+	Metadata       map[string]any `json:"metadata"`
 }
 
-type Node struct {
-	ID             string       `json:"id"`
-	Label          string       `json:"label"`
-	NormLabel      string       `json:"norm_label"`
-	Origin         string       `json:"_origin"`
-	FileType       string       `json:"file_type"`
-	Community      int          `json:"community"`
-	CommunityName  string       `json:"community_name"`
-	SourceFile     string       `json:"source_file"`
-	SourceLocation string       `json:"source_location"`
-	Type           string       `json:"type"`
-	Ecosystem      string       `json:"ecosystem"`
-	Metadata       NodeMetadata `json:"metadata"`
+// MetaString returns the metadata value for key when it is a string, or ""
+// when the key is absent or holds another type. Metadata is an open map
+// (graphify's own nodes carry kind/language; platform extractors carry
+// version/script/schedule/...), so callers pull the keys they know about.
+func (n Node) MetaString(key string) string {
+	s, _ := n.Metadata[key].(string)
+	return s
 }
 
 type Link struct {

@@ -20,7 +20,7 @@ import (
 // graphify-out/ directory.
 //
 // `update` is graphify's incremental, AST-only-by-default workflow per
-// architecture.md / graphify-readme.md ("re-extract only changed files",
+// docs/graphify/ ("re-extract only changed files",
 // "auto-rebuild on git commit (AST only, no API cost)"). This wrapper
 // matches that model:
 //   - the command runs from repoPath as its working directory

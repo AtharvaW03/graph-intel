@@ -30,12 +30,17 @@ func main() {
 	svc := query.NewService(client)
 	server := api.NewServer(svc)
 
+	token := os.Getenv("QUERY_AUTH_TOKEN")
+	if token == "" {
+		log.Printf("WARNING: QUERY_AUTH_TOKEN not set — serving without authentication")
+	}
+
 	addr := ":" + port
-	log.Printf("query-service listening on %s", addr)
+	log.Printf("query-service listening on %s (auth: %v)", addr, token != "")
 
 	httpServer := &http.Server{
 		Addr:              addr,
-		Handler:           server.Routes(),
+		Handler:           api.WithAuth(server.Routes(), token),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

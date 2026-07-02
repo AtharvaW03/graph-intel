@@ -95,15 +95,14 @@ func (s *Service) runDepQuery(ctx context.Context, cypher string, params map[str
 // mean "any". Results are ordered by repo then path.
 //
 // HttpRoute nodes carry the method + HTTP path in their `name` property
-// (formatted "METHOD /path" by the extractor). Neither `rt.method` nor
-// `rt.path` (as an HTTP path) exists on the node in Neo4j — the extractor's
-// per-node metadata dict is not written by the importer, and the extractor's
-// SourceFile is stored under the property `path` (which is a filesystem path
-// not an HTTP path). We therefore filter and project by parsing `rt.name`.
+// (formatted "METHOD /path" by the extractor); the node's `path` property is
+// the source FILE path, not the HTTP path. Method and path are parsed from
+// `rt.name` — which works for data imported before metadata promotion — and
+// the handler falls back to the promoted `handler` property when present.
 //
-// The query no longer joins through (:Repository) — each HttpRoute already
-// carries a `repo` property set by importNodeBatch, so scoping by repo is a
-// direct property filter with no join.
+// The query doesn't join through (:Repository) — each HttpRoute carries a
+// `repo` property set by importNodeBatch (routes are repo-owned, not shared),
+// so scoping by repo is a direct property filter with no join.
 func (s *Service) FindRoutes(ctx context.Context, method, pathContains, repo string) ([]HTTPRoute, error) {
 	const cypher = `
 MATCH (rt:HttpRoute)
@@ -114,13 +113,13 @@ WITH rt,
 WHERE ($method = '' OR toUpper(method_part) = toUpper($method))
   AND ($path = '' OR toLower(path_part) CONTAINS toLower($path))
   AND ($repo = '' OR coalesce(rt.repo, '') = $repo)
-RETURN coalesce(rt.repo, '')  AS repo,
-       method_part            AS method,
-       path_part              AS path,
-       ''                     AS handler,
-       labels(rt)             AS labels,
-       coalesce(rt.path, '')  AS file_path,
-       coalesce(rt.line, '')  AS line
+RETURN coalesce(rt.repo, '')     AS repo,
+       method_part               AS method,
+       path_part                 AS path,
+       coalesce(rt.handler, '')  AS handler,
+       labels(rt)                AS labels,
+       coalesce(rt.path, '')     AS file_path,
+       coalesce(rt.line, '')     AS line
 ORDER BY repo, path
 LIMIT 500
 `
@@ -166,13 +165,17 @@ func (s *Service) FindKafkaTopic(ctx context.Context, topic string) (*KafkaTopic
 	// (graphify_id = "repo::<name>"), not from :Repository. Filter to those
 	// hub nodes so we surface repo names, not arbitrary function nodes if
 	// the extractor is later extended to emit finer-grained producers.
+	//
+	// Aggregation groups by t.name (not by node) so producers and consumers
+	// are collected across every node carrying the topic's name — the current
+	// unified shared node plus any legacy per-repo duplicates from imports
+	// that predate cross-repo node unification.
 	const cypher = `
 MATCH (t:KafkaTopic {name: $topic})
 OPTIONAL MATCH (rp:Entity)-[:PRODUCES]->(t) WHERE rp.graphify_id STARTS WITH 'repo::'
-WITH t, collect(DISTINCT rp.name) AS producers
 OPTIONAL MATCH (rc:Entity)-[:CONSUMES]->(t) WHERE rc.graphify_id STARTS WITH 'repo::'
 RETURN t.name                             AS topic,
-       producers                          AS producers,
+       collect(DISTINCT rp.name)          AS producers,
        collect(DISTINCT rc.name)          AS consumers
 `
 	out, err := s.read(ctx, func(tx driver.ManagedTransaction) (any, error) {

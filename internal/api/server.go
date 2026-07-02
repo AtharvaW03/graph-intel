@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log"
@@ -9,6 +10,34 @@ import (
 
 	"graph-platform/internal/query"
 )
+
+// WithAuth wraps h with static bearer-token authentication. An empty token
+// disables auth entirely (open mode for local development — the caller should
+// log loudly when that happens). /health stays unauthenticated so load
+// balancers and uptime probes work without credentials.
+//
+// A static shared token is deliberately minimal: it keeps the org-wide code
+// index off the open network today, while the eventual repo-permission-aware
+// access control (per-user tokens mapped to Git permissions) slots in here
+// without touching handlers.
+func WithAuth(h http.Handler, token string) http.Handler {
+	if token == "" {
+		return h
+	}
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			h.ServeHTTP(w, r)
+			return
+		}
+		got := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(got, expected) != 1 {
+			writeErr(w, http.StatusUnauthorized, "missing or invalid bearer token")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
 
 type Server struct {
 	svc *query.Service

@@ -8,7 +8,7 @@
 #
 # `graphify` controls how the AST extractor is invoked. The default is
 # `graphify update <repo_path>` — graphify's incremental, AST-only
-# workflow (per architecture.md). It writes inside the repo at
+# workflow (per docs/graphify/architecture.md). It writes inside the repo at
 # `<repo_path>/graphify-out/graph.json`, so there is no --out flag and no
 # {out_dir} placeholder. The only supported placeholder in args is
 # {repo_path}; output_file is resolved relative to it.
@@ -25,7 +25,7 @@
 repositories:
   - name: golang-gin-realworld-example-app
     url: https://github.com/gothinkster/golang-gin-realworld-example-app.git
-    branch: master
+    branch: main
 
 git:
   timeout: 10m
@@ -44,7 +44,7 @@ extractors:
   kafka: true
   mssql: true
   glue: true
-  max_parallel: 0  # 0 = all in parallel
+  max_parallel: 0 # 0 = all in parallel
 
 org:
   prefixes:

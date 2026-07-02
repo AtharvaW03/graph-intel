@@ -3,11 +3,21 @@ package neo4j
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"graph-platform/internal/graphify"
 
 	driver "github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
+
+// orNil turns "" into nil so `SET n += {...}` skips the property instead of
+// writing an empty string onto every node.
+func orNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
 
 const batchSize = 500
 
@@ -33,6 +43,20 @@ var labelAllowlist = map[string]bool{
 	"SqlTrigger":    true,
 	"SqlFunction":   true,
 	"GlueJob":       true,
+	"GlueSchedule":  true,
+}
+
+// metadataProps are the extractor-metadata keys promoted to first-class node
+// properties at import. Everything else in a node's metadata dict is dropped:
+// Neo4j properties must be primitives or arrays thereof, and an open
+// pass-through would let one extractor bloat every node. Add a key here AND
+// have the query layer read it — a property nobody queries is dead weight.
+var metadataProps = []string{
+	"version", "scope", "manifest", // deps
+	"method", "handler", // httpapi
+	"script", "schedule", "sources", "dests", "expression", // glue
+	"is_repository", "discovered_as", // deps repo hubs
+	"schema", "object_name", // mssql
 }
 
 type Client struct {
@@ -128,18 +152,39 @@ func (c *Client) ImportNodes(ctx context.Context, repo, commit string, nodes []g
 		idToKey[n.ID] = key
 		labelCounts[label]++
 
-		labelGroups[label] = append(labelGroups[label], map[string]any{
+		// Shared (org-global) nodes carry no repo property: they belong to
+		// every repo that references them, and the repo-scoped sweep must
+		// never delete them on another repo's behalf. Setting a map value to
+		// nil makes Cypher's `SET n += {...}` remove/skip the property.
+		var repoProp, sharedProp any
+		if graphify.IsShared(n) {
+			sharedProp = true
+		} else {
+			repoProp = repo
+		}
+
+		row := map[string]any{
 			"key":            key,
 			"graphify_id":    n.ID,
 			"name":           n.Label,
 			"norm_name":      n.NormLabel,
 			"path":           n.SourceFile,
 			"line":           n.SourceLocation,
-			"language":       n.Metadata.Language,
+			"language":       n.MetaString("language"),
 			"file_type":      n.FileType,
 			"community":      n.Community,
 			"community_name": n.CommunityName,
-		})
+			"ecosystem":      orNil(n.Ecosystem),
+			"repo":           repoProp,
+			"shared":         sharedProp,
+		}
+		for _, k := range metadataProps {
+			row[k] = nil
+			if v, ok := n.Metadata[k]; ok {
+				row[k] = v
+			}
+		}
+		labelGroups[label] = append(labelGroups[label], row)
 	}
 
 	for label, rows := range labelGroups {
@@ -158,11 +203,12 @@ func (c *Client) ImportNodes(ctx context.Context, repo, commit string, nodes []g
 }
 
 // ImportLinks imports all links in relation-type-grouped UNWIND batches.
-// commit, if non-empty, is stamped onto every edge as last_commit so stale
-// edges (same endpoints but the relation was removed in a later commit)
-// can be swept by SweepStale.
+// Every edge is stamped with the importing repo so the stale sweep can scope
+// edge deletion per repo even when an endpoint is a shared node. commit, if
+// non-empty, is stamped onto every edge as last_commit so stale edges (same
+// endpoints but the relation was removed in a later commit) can be swept.
 // Returns per-relation counts, skipped-unknown count, and skipped-dangling count.
-func (c *Client) ImportLinks(ctx context.Context, commit string, links []graphify.Link, idToKey map[string]string) (map[string]int, int, int, error) {
+func (c *Client) ImportLinks(ctx context.Context, repo, commit string, links []graphify.Link, idToKey map[string]string) (map[string]int, int, int, error) {
 	relGroups := make(map[string][]map[string]any)
 	relCounts := make(map[string]int)
 	skippedUnknown := 0
@@ -197,7 +243,7 @@ func (c *Client) ImportLinks(ctx context.Context, commit string, links []graphif
 			if end > len(rows) {
 				end = len(rows)
 			}
-			if err := c.importLinkBatch(ctx, rel, commit, rows[i:end]); err != nil {
+			if err := c.importLinkBatch(ctx, rel, repo, commit, rows[i:end]); err != nil {
 				return nil, 0, 0, fmt.Errorf("import links (%s): %w", rel, err)
 			}
 		}
@@ -210,6 +256,11 @@ func (c *Client) ImportLinks(ctx context.Context, commit string, links []graphif
 // does not match the current commit. It is the cleanup step that keeps the
 // graph in sync with the source tree on re-index — nodes/edges deleted in the
 // new commit are removed instead of accumulating forever.
+//
+// Shared (org-global) nodes are handled specially: they carry no repo
+// property, so the repo-scoped node sweep never touches them. Instead, a
+// final orphan pass deletes any shared node that no longer has an edge to or
+// from any Entity — i.e. every repo that referenced it has dropped its edges.
 //
 // commit must be non-empty; an empty commit would sweep everything for the
 // repo, which is almost certainly an operator error and so is refused.
@@ -224,54 +275,90 @@ func (c *Client) SweepStale(ctx context.Context, repo, commit string) (int, int,
 	session := c.Driver.NewSession(ctx, driver.SessionConfig{})
 	defer session.Close(ctx)
 
-	// Step 1: sweep stale relationships whose endpoints are not (yet) being
-	// removed by node sweep. Edges with NULL last_commit are legacy edges from
-	// before stamping was added; they're treated as stale too.
-	relRes, err := session.Run(ctx, `
-MATCH (a:Entity {repo: $repo})-[r]->(b:Entity)
-WHERE (r.last_commit IS NULL OR r.last_commit <> $commit)
-DELETE r
-RETURN count(r) AS deleted`, map[string]any{"repo": repo, "commit": commit})
-	if err != nil {
-		return 0, 0, fmt.Errorf("sweep stale relationships: %w", err)
+	runCount := func(query string, params map[string]any, what string) (int, error) {
+		res, err := session.Run(ctx, query, params)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", what, err)
+		}
+		rec, err := res.Single(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("%s (read): %w", what, err)
+		}
+		n, _ := rec.AsMap()["deleted"].(int64)
+		return int(n), nil
 	}
-	relRec, err := relRes.Single(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("sweep stale relationships (read): %w", err)
-	}
-	relsDeleted := int(relRec.AsMap()["deleted"].(int64))
+	params := map[string]any{"repo": repo, "commit": commit}
 
-	// Step 2: sweep stale nodes. DETACH DELETE also removes Repository
-	// containment edges, which is fine — they're re-created on the next import.
-	nodeRes, err := session.Run(ctx, `
+	// Step 1: sweep stale relationships. Edges are matched by their own repo
+	// stamp so an edge from this repo to a shared node is swept even though
+	// the shared endpoint carries no repo property. The `r.repo IS NULL AND
+	// a.repo = $repo` clause covers legacy edges from before edge stamping.
+	relsDeleted, err := runCount(`
+MATCH (a)-[r]->(b:Entity)
+WHERE (r.repo = $repo OR (r.repo IS NULL AND a.repo = $repo))
+  AND (r.last_commit IS NULL OR r.last_commit <> $commit)
+DELETE r
+RETURN count(r) AS deleted`, params, "sweep stale relationships")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Step 2: sweep stale repo-owned nodes. DETACH DELETE also removes
+	// Repository containment edges, which is fine — they're re-created on the
+	// next import. Shared nodes never match: they have no repo property.
+	nodesDeleted, err := runCount(`
 MATCH (n:Entity {repo: $repo})
 WHERE (n.last_commit IS NULL OR n.last_commit <> $commit)
+  AND coalesce(n.shared, false) = false
 DETACH DELETE n
-RETURN count(n) AS deleted`, map[string]any{"repo": repo, "commit": commit})
+RETURN count(n) AS deleted`, params, "sweep stale nodes")
 	if err != nil {
-		return 0, 0, fmt.Errorf("sweep stale nodes: %w", err)
+		return 0, 0, err
 	}
-	nodeRec, err := nodeRes.Single(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("sweep stale nodes (read): %w", err)
-	}
-	nodesDeleted := int(nodeRec.AsMap()["deleted"].(int64))
 
-	return nodesDeleted, relsDeleted, nil
+	// Step 3: reap orphaned shared nodes — no repo references them anymore.
+	// Repository CONTAINS edges don't count as references; only Entity edges
+	// (PRODUCES, DEPENDS_ON, IN_SCHEMA, ...) keep a shared node alive.
+	orphans, err := runCount(`
+MATCH (n:Entity)
+WHERE n.shared = true AND NOT EXISTS { MATCH (n)--(:Entity) }
+DETACH DELETE n
+RETURN count(n) AS deleted`, map[string]any{}, "sweep orphaned shared nodes")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return nodesDeleted + orphans, relsDeleted, nil
 }
+
+// nodeProps are the row keys importNodeBatch copies onto the node. They are
+// package-internal constants (never user input), so interpolating them into
+// the Cypher SET map is safe. Row values may be nil — Cypher's `SET n += {}`
+// treats null as "remove the property", which is exactly what shared nodes
+// (repo: null) and absent metadata keys need.
+var nodeProps = append([]string{
+	"graphify_id", "name", "norm_name", "path", "line", "language",
+	"file_type", "community", "community_name", "ecosystem", "repo", "shared",
+}, metadataProps...)
 
 // importNodeBatch runs one UNWIND batch for a single label.
 // label is validated against labelAllowlist before reaching here, so
 // interpolating it into the query string is safe. commit, if non-empty, is
-// stamped on every node as last_commit; the empty case preserves legacy
-// behavior for the static-graph importer CLI.
+// stamped on every node and CONTAINS edge as last_commit; the empty case
+// preserves legacy behavior for the static-graph importer CLI.
 func (c *Client) importNodeBatch(ctx context.Context, label, repo, commit string, batch []map[string]any) error {
 	session := c.Driver.NewSession(ctx, driver.SessionConfig{})
 	defer session.Close(ctx)
 
+	setPairs := make([]string, 0, len(nodeProps))
+	for _, p := range nodeProps {
+		setPairs = append(setPairs, fmt.Sprintf("%s: row.%s", p, p))
+	}
 	commitClause := ""
+	containsCommit := ""
 	if commit != "" {
-		commitClause = ",\n    last_commit:   $commit"
+		commitClause = ",\n    last_commit: $commit"
+		containsCommit = ", c.last_commit = $commit"
 	}
 
 	query := fmt.Sprintf(`
@@ -280,18 +367,10 @@ UNWIND $batch AS row
 MERGE (n:Entity {node_key: row.key})
 SET n:%s
 SET n += {
-    graphify_id:   row.graphify_id,
-    repo:          $repo,
-    name:          row.name,
-    norm_name:     row.norm_name,
-    path:          row.path,
-    line:          row.line,
-    language:      row.language,
-    file_type:     row.file_type,
-    community:     row.community,
-    community_name: row.community_name%s
+    %s%s
 }
-MERGE (repo)-[:CONTAINS]->(n)`, label, commitClause)
+MERGE (repo)-[c:CONTAINS]->(n)
+SET c.repo = $repo%s`, label, strings.Join(setPairs, ",\n    "), commitClause, containsCommit)
 
 	params := map[string]any{"repo": repo, "batch": batch}
 	if commit != "" {
@@ -303,8 +382,9 @@ MERGE (repo)-[:CONTAINS]->(n)`, label, commitClause)
 
 // importLinkBatch runs one UNWIND batch for a single relationship type.
 // rel is validated via MapRelation's allowlist map before reaching here.
-// commit, if non-empty, stamps each edge so sweep can identify stale edges.
-func (c *Client) importLinkBatch(ctx context.Context, rel, commit string, batch []map[string]any) error {
+// repo stamps each edge for repo-scoped sweeps; commit, if non-empty, stamps
+// each edge so sweep can identify stale edges.
+func (c *Client) importLinkBatch(ctx context.Context, rel, repo, commit string, batch []map[string]any) error {
 	session := c.Driver.NewSession(ctx, driver.SessionConfig{})
 	defer session.Close(ctx)
 
@@ -322,10 +402,11 @@ SET r += {
     weight:           row.weight,
     confidence:       row.confidence,
     confidence_score: row.cs,
-    context:          row.context%s
+    context:          row.context,
+    repo:             $repo%s
 }`, rel, commitClause)
 
-	params := map[string]any{"batch": batch}
+	params := map[string]any{"batch": batch, "repo": repo}
 	if commit != "" {
 		params["commit"] = commit
 	}

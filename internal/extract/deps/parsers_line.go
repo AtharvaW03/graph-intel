@@ -34,17 +34,18 @@ func parseGoMod(_, contents string) ([]Dep, error) {
 }
 
 func appendGoModLine(deps []Dep, line string) []Dep {
-	// strip trailing comments
+	// Detect the indirect marker BEFORE stripping trailing comments — the
+	// marker lives inside the comment ("// indirect").
+	scope := "runtime"
+	if strings.Contains(line, "// indirect") {
+		scope = "indirect"
+	}
 	if i := strings.Index(line, "//"); i >= 0 {
 		line = strings.TrimSpace(line[:i])
 	}
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
 		return deps
-	}
-	scope := "runtime"
-	if strings.Contains(line, "indirect") {
-		scope = "indirect"
 	}
 	return append(deps, Dep{
 		Name:      fields[0],
